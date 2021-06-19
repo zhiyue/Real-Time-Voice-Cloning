@@ -2,16 +2,24 @@ from scipy.ndimage.morphology import binary_dilation
 from encoder.params_data import *
 from pathlib import Path
 from typing import Optional, Union
+from warnings import warn
 import numpy as np
-import webrtcvad
 import librosa
 import struct
+
+try:
+    import webrtcvad
+except:
+    warn("Unable to import 'webrtcvad'. This package enables noise removal and is recommended.")
+    webrtcvad=None
 
 int16_max = (2 ** 15) - 1
 
 
 def preprocess_wav(fpath_or_wav: Union[str, Path, np.ndarray],
-                   source_sr: Optional[int] = None):
+                   source_sr: Optional[int] = None,
+                   normalize: Optional[bool] = True,
+                   trim_silence: Optional[bool] = True):
     """
     Applies the preprocessing operations used in training the Speaker Encoder to a waveform 
     either on disk or in memory. The waveform will be resampled to match the data hyperparameters.
@@ -25,7 +33,7 @@ def preprocess_wav(fpath_or_wav: Union[str, Path, np.ndarray],
     """
     # Load the wav from disk if needed
     if isinstance(fpath_or_wav, str) or isinstance(fpath_or_wav, Path):
-        wav, source_sr = librosa.load(fpath_or_wav, sr=None)
+        wav, source_sr = librosa.load(str(fpath_or_wav), sr=None)
     else:
         wav = fpath_or_wav
     
@@ -34,8 +42,10 @@ def preprocess_wav(fpath_or_wav: Union[str, Path, np.ndarray],
         wav = librosa.resample(wav, source_sr, sampling_rate)
         
     # Apply the preprocessing: normalize volume and shorten long silences 
-    wav = normalize_volume(wav, audio_norm_target_dBFS, increase_only=True)
-    wav = trim_long_silences(wav)
+    if normalize:
+        wav = normalize_volume(wav, audio_norm_target_dBFS, increase_only=True)
+    if webrtcvad and trim_silence:
+        wav = trim_long_silences(wav)
     
     return wav
 
@@ -101,9 +111,7 @@ def trim_long_silences(wav):
 def normalize_volume(wav, target_dBFS, increase_only=False, decrease_only=False):
     if increase_only and decrease_only:
         raise ValueError("Both increase only and decrease only are set")
-    rms = np.sqrt(np.mean((wav * int16_max) ** 2))
-    wave_dBFS = 20 * np.log10(rms / int16_max)
-    dBFS_change = target_dBFS - wave_dBFS
-    if dBFS_change < 0 and increase_only or dBFS_change > 0 and decrease_only:
+    dBFS_change = target_dBFS - 10 * np.log10(np.mean(wav ** 2))
+    if (dBFS_change < 0 and increase_only) or (dBFS_change > 0 and decrease_only):
         return wav
     return wav * (10 ** (dBFS_change / 20))

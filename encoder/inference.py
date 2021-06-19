@@ -30,7 +30,7 @@ def load_model(weights_fpath: Path, device=None):
     elif isinstance(device, str):
         _device = torch.device(device)
     _model = SpeakerEncoder(_device, torch.device("cpu"))
-    checkpoint = torch.load(weights_fpath)
+    checkpoint = torch.load(weights_fpath, _device)
     _model.load_state_dict(checkpoint["model_state"])
     _model.eval()
     print("Loaded encoder \"%s\" trained to step %d" % (weights_fpath.name, checkpoint["step"]))
@@ -171,7 +171,8 @@ def plot_embedding_as_heatmap(embed, ax=None, title="", shape=None, color_range=
     cmap = cm.get_cmap()
     mappable = ax.imshow(embed, cmap=cmap)
     cbar = plt.colorbar(mappable, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_clim(*color_range)
+    sm = cm.ScalarMappable(cmap=cmap)
+    sm.set_clim(*color_range)
     
     ax.set_xticks([]), ax.set_yticks([])
     ax.set_title(title)

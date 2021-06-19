@@ -1,19 +1,20 @@
+import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QStringListModel
 from PyQt5.QtWidgets import *
 from encoder.inference import plot_embedding_as_heatmap
 from toolbox.utterance import Utterance
 from pathlib import Path
 from typing import List, Set
 import sounddevice as sd
-import matplotlib.pyplot as plt
+import soundfile as sf
 import numpy as np
 # from sklearn.manifold import TSNE         # You can try with TSNE if you like, I prefer UMAP 
 from time import sleep
 import umap
 import sys
-from warnings import filterwarnings
+from warnings import filterwarnings, warn
 filterwarnings("ignore")
 
 
@@ -37,7 +38,6 @@ colormap = np.array([
 default_text = \
     "Welcome to the toolbox! To begin, load an utterance from your datasets or record one " \
     "yourself.\nOnce its embedding has been created, you can synthesize any text written here.\n" \
-    "With the current synthesizer model, punctuation and special characters will be ignored.\n" \
     "The synthesizer expects to generate " \
     "outputs that are somewhere between 5 and 12 seconds.\nTo mark breaks, write a new line. " \
     "Each line will be treated separately.\nThen, they are joined together to make the final " \
@@ -136,10 +136,75 @@ class UI(QDialog):
         self.umap_ax.set_xticks([])
         self.umap_ax.set_yticks([])
         self.umap_ax.figure.canvas.draw()
+
+    def save_audio_file(self, wav, sample_rate):        
+        dialog = QFileDialog()
+        dialog.setDefaultSuffix(".wav")
+        fpath, _ = dialog.getSaveFileName(
+            parent=self,
+            caption="Select a path to save the audio file",
+            filter="Audio Files (*.flac *.wav)"
+        )
+        if fpath:
+            #Default format is wav
+            if Path(fpath).suffix == "":
+                fpath += ".wav"
+            sf.write(fpath, wav, sample_rate)
+
+    def setup_audio_devices(self, sample_rate):
+        input_devices = []
+        output_devices = []
+        for device in sd.query_devices():
+            # Check if valid input
+            try:
+                sd.check_input_settings(device=device["name"], samplerate=sample_rate)
+                input_devices.append(device["name"])
+            except:
+                pass
+
+            # Check if valid output
+            try:
+                sd.check_output_settings(device=device["name"], samplerate=sample_rate)
+                output_devices.append(device["name"])
+            except Exception as e:
+                # Log a warning only if the device is not an input
+                if not device["name"] in input_devices:
+                    warn("Unsupported output device %s for the sample rate: %d \nError: %s" % (device["name"], sample_rate, str(e)))
+
+        if len(input_devices) == 0:
+            self.log("No audio input device detected. Recording may not work.")
+            self.audio_in_device = None
+        else:
+            self.audio_in_device = input_devices[0]
+
+        if len(output_devices) == 0:
+            self.log("No supported output audio devices were found! Audio output may not work.")
+            self.audio_out_devices_cb.addItems(["None"])
+            self.audio_out_devices_cb.setDisabled(True)
+        else:
+            self.audio_out_devices_cb.clear()
+            self.audio_out_devices_cb.addItems(output_devices)
+            self.audio_out_devices_cb.currentTextChanged.connect(self.set_audio_device)
+
+        self.set_audio_device()
+
+    def set_audio_device(self):
         
+        output_device = self.audio_out_devices_cb.currentText()
+        if output_device == "None":
+            output_device = None
+
+        # If None, sounddevice queries portaudio
+        sd.default.device = (self.audio_in_device, output_device)
+    
     def play(self, wav, sample_rate):
-        sd.stop()
-        sd.play(wav, sample_rate)
+        try:
+            sd.stop()
+            sd.play(wav, sample_rate)
+        except Exception as e:
+            print(e)
+            self.log("Error in audio playback. Try selecting a different audio output device.")
+            self.log("Your device must be connected before you start the toolbox.")
         
     def stop(self):
         sd.stop()
@@ -165,7 +230,7 @@ class UI(QDialog):
         sd.wait()
         
         self.log("Done recording.")
-        self.record_button.setText("Record one")
+        self.record_button.setText("Record")
         self.record_button.setDisabled(False)
         
         return wav.squeeze()
@@ -230,6 +295,8 @@ class UI(QDialog):
                 self.utterance_box.setDisabled(True)
                 self.speaker_box.setDisabled(True)
                 self.dataset_box.setDisabled(True)
+                self.browser_load_button.setDisabled(True)
+                self.auto_next_checkbox.setDisabled(True)
                 return 
             self.repopulate_box(self.dataset_box, datasets, random)
     
@@ -260,7 +327,7 @@ class UI(QDialog):
         return self.encoder_box.itemData(self.encoder_box.currentIndex())
     
     @property
-    def current_synthesizer_model_dir(self):
+    def current_synthesizer_fpath(self):
         return self.synthesizer_box.itemData(self.synthesizer_box.currentIndex())
     
     @property
@@ -276,13 +343,10 @@ class UI(QDialog):
         self.repopulate_box(self.encoder_box, [(f.stem, f) for f in encoder_fpaths])
         
         # Synthesizer
-        synthesizer_model_dirs = list(synthesizer_models_dir.glob("*"))
-        synthesizer_items = [(f.name.replace("logs-", ""), f) for f in synthesizer_model_dirs]
-        if len(synthesizer_model_dirs) == 0:
-            raise Exception("No synthesizer models found in %s. For the synthesizer, the expected "
-                            "structure is <syn_models_dir>/logs-<model_name>/taco_pretrained/"
-                            "checkpoint" % synthesizer_models_dir)
-        self.repopulate_box(self.synthesizer_box, synthesizer_items)
+        synthesizer_fpaths = list(synthesizer_models_dir.glob("**/*.pt"))
+        if len(synthesizer_fpaths) == 0:
+            raise Exception("No synthesizer models found in %s" % synthesizer_models_dir)
+        self.repopulate_box(self.synthesizer_box, [(f.stem, f) for f in synthesizer_fpaths])
 
         # Vocoder
         vocoder_fpaths = list(vocoder_models_dir.glob("**/*.pt"))
@@ -326,6 +390,26 @@ class UI(QDialog):
         self.loading_bar.setTextVisible(value != 0)
         self.app.processEvents()
 
+    def populate_gen_options(self, seed, trim_silences):
+        if seed is not None:
+            self.random_seed_checkbox.setChecked(True)
+            self.seed_textbox.setText(str(seed))
+            self.seed_textbox.setEnabled(True)
+        else:
+            self.random_seed_checkbox.setChecked(False)
+            self.seed_textbox.setText(str(0))
+            self.seed_textbox.setEnabled(False)
+
+        if not trim_silences:
+            self.trim_silences_checkbox.setChecked(False)
+            self.trim_silences_checkbox.setDisabled(True)
+
+    def update_seed_textbox(self):
+        if self.random_seed_checkbox.isChecked():
+            self.seed_textbox.setEnabled(True)
+        else:
+            self.seed_textbox.setEnabled(False)
+
     def reset_interface(self):
         self.draw_embed(None, None, "current")
         self.draw_embed(None, None, "generated")
@@ -337,6 +421,8 @@ class UI(QDialog):
         self.generate_button.setDisabled(True)
         self.synthesize_button.setDisabled(True)
         self.vocode_button.setDisabled(True)
+        self.replay_wav_button.setDisabled(True)
+        self.export_wav_button.setDisabled(True)
         [self.log("") for _ in range(self.max_log_lines)]
 
     def __init__(self):
@@ -353,24 +439,24 @@ class UI(QDialog):
         
         # Browser
         browser_layout = QGridLayout()
-        root_layout.addLayout(browser_layout, 0, 1)
-        
-        # Visualizations
-        vis_layout = QVBoxLayout()
-        root_layout.addLayout(vis_layout, 1, 1, 2, 3)
+        root_layout.addLayout(browser_layout, 0, 0, 1, 2)
         
         # Generation
         gen_layout = QVBoxLayout()
-        root_layout.addLayout(gen_layout, 0, 2)
+        root_layout.addLayout(gen_layout, 0, 2, 1, 2)
         
         # Projections
         self.projections_layout = QVBoxLayout()
-        root_layout.addLayout(self.projections_layout, 1, 0)
+        root_layout.addLayout(self.projections_layout, 1, 0, 1, 1)
+        
+        # Visualizations
+        vis_layout = QVBoxLayout()
+        root_layout.addLayout(vis_layout, 1, 1, 1, 3)
 
 
         ## Projections
         # UMap
-        fig, self.umap_ax = plt.subplots(figsize=(4, 4), facecolor="#F0F0F0")
+        fig, self.umap_ax = plt.subplots(figsize=(3, 3), facecolor="#F0F0F0")
         fig.subplots_adjust(left=0.02, bottom=0.02, right=0.98, top=0.98)
         self.projections_layout.addWidget(FigureCanvas(fig))
         self.umap_hot = False
@@ -390,8 +476,6 @@ class UI(QDialog):
         self.utterance_box = QComboBox()
         browser_layout.addWidget(QLabel("<b>Utterance</b>"), i, 2)
         browser_layout.addWidget(self.utterance_box, i + 1, 2)
-        self.browser_browse_button = QPushButton("Browse")
-        browser_layout.addWidget(self.browser_browse_button, i, 3)
         self.browser_load_button = QPushButton("Load")
         browser_layout.addWidget(self.browser_load_button, i + 1, 3)
         i += 2
@@ -410,25 +494,23 @@ class UI(QDialog):
         
         # Utterance box
         browser_layout.addWidget(QLabel("<b>Use embedding from:</b>"), i, 0)
-        i += 1
-        
-        # Random & next utterance buttons
         self.utterance_history = QComboBox()
-        browser_layout.addWidget(self.utterance_history, i, 0, 1, 3)
+        browser_layout.addWidget(self.utterance_history, i, 1, 1, 3)
         i += 1
         
         # Random & next utterance buttons
-        self.take_generated_button = QPushButton("Take generated")
-        browser_layout.addWidget(self.take_generated_button, i, 0)
+        self.browser_browse_button = QPushButton("Browse")
+        browser_layout.addWidget(self.browser_browse_button, i, 0)
         self.record_button = QPushButton("Record")
         browser_layout.addWidget(self.record_button, i, 1)
         self.play_button = QPushButton("Play")
         browser_layout.addWidget(self.play_button, i, 2)
         self.stop_button = QPushButton("Stop")
         browser_layout.addWidget(self.stop_button, i, 3)
-        i += 2
+        i += 1
 
-        # Model selection
+
+        # Model and audio output selection
         self.encoder_box = QComboBox()
         browser_layout.addWidget(QLabel("<b>Encoder</b>"), i, 0)
         browser_layout.addWidget(self.encoder_box, i + 1, 0)
@@ -438,7 +520,26 @@ class UI(QDialog):
         self.vocoder_box = QComboBox()
         browser_layout.addWidget(QLabel("<b>Vocoder</b>"), i, 2)
         browser_layout.addWidget(self.vocoder_box, i + 1, 2)
+        
+        self.audio_out_devices_cb=QComboBox()
+        browser_layout.addWidget(QLabel("<b>Audio Output</b>"), i, 3)
+        browser_layout.addWidget(self.audio_out_devices_cb, i + 1, 3)
         i += 2
+
+        #Replay & Save Audio
+        browser_layout.addWidget(QLabel("<b>Toolbox Output:</b>"), i, 0)
+        self.waves_cb = QComboBox()
+        self.waves_cb_model = QStringListModel()
+        self.waves_cb.setModel(self.waves_cb_model)
+        self.waves_cb.setToolTip("Select one of the last generated waves in this section for replaying or exporting")
+        browser_layout.addWidget(self.waves_cb, i, 1)
+        self.replay_wav_button = QPushButton("Replay")
+        self.replay_wav_button.setToolTip("Replay last generated vocoder")
+        browser_layout.addWidget(self.replay_wav_button, i, 2)
+        self.export_wav_button = QPushButton("Export")
+        self.export_wav_button.setToolTip("Save last generated vocoder audio in filesystem as a wav file")
+        browser_layout.addWidget(self.export_wav_button, i, 3)
+        i += 1
 
 
         ## Embed & spectrograms
@@ -474,6 +575,19 @@ class UI(QDialog):
         self.vocode_button = QPushButton("Vocode only")
         layout.addWidget(self.vocode_button)
         gen_layout.addLayout(layout)
+
+        layout_seed = QGridLayout()
+        self.random_seed_checkbox = QCheckBox("Random seed:")
+        self.random_seed_checkbox.setToolTip("When checked, makes the synthesizer and vocoder deterministic.")
+        layout_seed.addWidget(self.random_seed_checkbox, 0, 0)
+        self.seed_textbox = QLineEdit()
+        self.seed_textbox.setMaximumWidth(80)
+        layout_seed.addWidget(self.seed_textbox, 0, 1)
+        self.trim_silences_checkbox = QCheckBox("Enhance vocoder output")
+        self.trim_silences_checkbox.setToolTip("When checked, trims excess silence in vocoder output."
+            " This feature requires `webrtcvad` to be installed.")
+        layout_seed.addWidget(self.trim_silences_checkbox, 0, 2, 1, 2)
+        gen_layout.addLayout(layout_seed)
 
         self.loading_bar = QProgressBar()
         gen_layout.addWidget(self.loading_bar)
